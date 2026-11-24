@@ -27,6 +27,8 @@ import org.apache.calcite.plan.RelOptCost;
 import org.apache.calcite.plan.RelOptTable;
 import org.apache.calcite.plan.RelTraitDef;
 import org.apache.calcite.plan.RelTraitSet;
+import org.apache.calcite.plan.hep.HepPlanner;
+import org.apache.calcite.plan.hep.HepProgram;
 import org.apache.calcite.rel.EmptyRowTypePolicy;
 import org.apache.calcite.rel.RelCollations;
 import org.apache.calcite.rel.RelDistributions;
@@ -47,6 +49,7 @@ import org.apache.calcite.rel.core.Window;
 import org.apache.calcite.rel.hint.RelHint;
 import org.apache.calcite.rel.logical.LogicalValues;
 import org.apache.calcite.rel.metadata.RelMetadataQuery;
+import org.apache.calcite.rel.rules.CoreRules;
 import org.apache.calcite.rel.type.RelDataType;
 import org.apache.calcite.rel.type.RelDataTypeFactory;
 import org.apache.calcite.rel.type.RelDataTypeField;
@@ -120,6 +123,7 @@ import java.sql.DriverManager;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -153,6 +157,7 @@ import static org.hamcrest.Matchers.hasToString;
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTimeoutPreemptively;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
 
@@ -847,6 +852,109 @@ public class RelBuilderTest {
           is("field ordinal [20] out of range; "
                   + "input fields are: [DEPTNO, DNAME, LOC]"));
     }
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7953">[CALCITE-7953]
+   * RelBuilder.fields(Iterable&lt;String&gt;) searches the input once per
+   * name, so resolving many fields by name is quadratic</a>. After a join,
+   * the input's field names repeat, and {@code fields} returns the first
+   * field with each name, as {@link RelBuilder#field(String)} does. */
+  @Test void testFieldsByNameAfterJoin() {
+    final RelBuilder builder = RelBuilder.create(config().build());
+    builder.scan("EMP")
+        .scan("DEPT")
+        .join(JoinRelType.INNER, builder.literal(true));
+    assertThat(builder.fields(ImmutableList.of("DNAME", "DEPTNO", "LOC")),
+        hasToString("[$9, $7, $10]"));
+    final IllegalArgumentException e =
+        assertThrows(IllegalArgumentException.class, () ->
+            builder.fields(ImmutableList.of("DNAME", "DEPTNO", "DEPTNO0")));
+    assertThat(e.getMessage(),
+        is("field [DEPTNO0] not found; input fields are: [EMPNO, ENAME, "
+            + "JOB, MGR, HIREDATE, SAL, COMM, DEPTNO, DEPTNO, DNAME, LOC]"));
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7953">[CALCITE-7953]
+   * RelBuilder.fields(Iterable&lt;String&gt;) searches the input once per
+   * name, so resolving many fields by name is quadratic</a>. The row type
+   * returns its dynamic star field for a name it does not have, but
+   * {@code fields} throws, as {@link RelBuilder#field(String)} does. */
+  @Test void testFieldsByNameWithDynamicStar() {
+    final RelBuilder builder = RelBuilder.create(config().build());
+    builder.scan("EMP");
+    final List<RexNode> projects = new ArrayList<>(builder.fields());
+    projects.add(
+        builder.getRexBuilder().makeNullLiteral(
+            builder.getTypeFactory().createSqlType(SqlTypeName.DYNAMIC_STAR)));
+    final List<String> names =
+        new ArrayList<>(builder.peek().getRowType().getFieldNames());
+    names.add("**");
+    builder.project(projects, names);
+    assertThat(builder.fields(ImmutableList.of("SAL", "ENAME", "**")),
+        hasToString("[$5, $1, $8]"));
+    final IllegalArgumentException e =
+        assertThrows(IllegalArgumentException.class, () ->
+            builder.fields(ImmutableList.of("SAL", "ENAME", "deptno")));
+    assertThat(e.getMessage(),
+        is("field [deptno] not found; input fields are: " + names));
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7953">[CALCITE-7953]
+   * RelBuilder.fields(Iterable&lt;String&gt;) searches the input once per
+   * name, so resolving many fields by name is quadratic</a>. If the last
+   * field is "_extra", the row type returns a field for any name, but
+   * {@code fields} throws for a name it does not have, as
+   * {@link RelBuilder#field(String)} does. */
+  @Test void testFieldsByNameWithExtraField() {
+    final RelBuilder builder = RelBuilder.create(config().build());
+    builder.scan("EMP");
+    final List<RexNode> projects = new ArrayList<>(builder.fields());
+    projects.add(builder.field("EMPNO"));
+    final List<String> names =
+        new ArrayList<>(builder.peek().getRowType().getFieldNames());
+    names.add("_extra");
+    builder.project(projects, names);
+    assertThat(builder.fields(ImmutableList.of("SAL", "ENAME", "_extra")),
+        hasToString("[$5, $1, $8]"));
+    final IllegalArgumentException e =
+        assertThrows(IllegalArgumentException.class, () ->
+            builder.fields(ImmutableList.of("SAL", "ENAME", "deptno")));
+    assertThat(e.getMessage(),
+        is("field [deptno] not found; input fields are: " + names));
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7953">[CALCITE-7953]
+   * RelBuilder.fields(Iterable&lt;String&gt;) searches the input once per
+   * name, so resolving many fields by name is quadratic</a>.
+   *
+   * <p>The input joins two 50,000-field inputs. Looking up all 100,000 fields
+   * takes about 20 seconds before the fix and 50 milliseconds after. */
+  @Test void testFieldsByNameOnWideInput() {
+    final RelBuilder builder = RelBuilder.create(config().build());
+    final int n = 50_000;
+    final List<String> names = new ArrayList<>();
+    for (String prefix : ImmutableList.of("L", "R")) {
+      builder.scan("EMP");
+      final List<RexNode> projects = new ArrayList<>();
+      final List<String> inputNames = new ArrayList<>();
+      for (int i = 0; i < n; i++) {
+        projects.add(builder.field(i % 8));
+        inputNames.add(prefix + i);
+      }
+      builder.project(projects, inputNames);
+      names.addAll(inputNames);
+    }
+    builder.join(JoinRelType.INNER, builder.literal(true));
+    final List<RexNode> fields =
+        assertTimeoutPreemptively(Duration.ofSeconds(2), () ->
+            builder.fields(names));
+    assertThat(fields, hasSize(2 * n));
+    assertThat(fields.get(0), hasToString("$0"));
+    assertThat(fields.get(2 * n - 1), hasToString("$" + (2 * n - 1)));
   }
 
   @Test void testBadType() {
@@ -5456,6 +5564,63 @@ public class RelBuilderTest {
         + "LogicalFilter(condition=[=($2, 3)])\n"
         + "  LogicalTableScan(table=[[scott, EMP]])\n";
     assertThat(Util.toLinux(builder.toString()), is(expected3));
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7912">[CALCITE-7912]
+   * Prune UNION ALL branches that cannot affect an enclosing aggregate</a>.
+   *
+   * <p>Unions a SMALLINT column with a BIGINT NULL column and sums it. Without
+   * the rule the plan fails at run time, because the SMALLINT branch is not
+   * cast to the union's BIGINT type. After the rule removes the NULL branch,
+   * the remaining branch must be cast, so that the sum runs as BIGINT and does
+   * not overflow SMALLINT. */
+  @Test void testAggregateUnionNullBranchRunsAtUnionType() throws Exception {
+    try (Connection connection = DriverManager.getConnection("jdbc:calcite:")) {
+      final SchemaPlus root =
+          connection.unwrap(CalciteConnection.class).getRootSchema();
+      CalciteAssert.addSchema(root, CalciteAssert.SchemaSpec.SCOTT);
+      final RelBuilder b =
+          RelBuilder.create(Frameworks.newConfigBuilder().defaultSchema(root).build());
+      final RelDataType nullableBigint =
+          b.getTypeFactory().createTypeWithNullability(
+              b.getTypeFactory().createSqlType(SqlTypeName.BIGINT), true);
+      b.scan("scott", "EMP")
+          .project(b.alias(b.cast(b.field("EMPNO"), SqlTypeName.SMALLINT), "M"));
+      b.scan("scott", "DEPT")
+          .project(b.alias(b.getRexBuilder().makeNullLiteral(nullableBigint), "M"));
+      final RelNode rel =
+          b.union(true, 2)
+              .aggregate(b.groupKey(),
+                  b.aggregateCall(SqlStdOperatorTable.SUM, b.field("M")).as("S"))
+              .build();
+
+      // The sum of the 14 EMPNO values exceeds SMALLINT. The unrewritten plan
+      // cannot run.
+      assertThrows(Exception.class, () -> {
+        try (PreparedStatement ps = RelRunners.run(rel)) {
+          ps.executeQuery();
+        }
+      });
+
+      final HepPlanner hepPlanner =
+          new HepPlanner(
+              HepProgram.builder()
+                  .addRuleInstance(CoreRules.AGGREGATE_UNION_NULL_BRANCH)
+                  .build());
+      hepPlanner.setRoot(rel);
+      final RelNode rewritten = hepPlanner.findBestExp();
+      final String expectedPlan = ""
+          + "LogicalAggregate(group=[{}], S=[SUM($0)])\n"
+          + "  LogicalProject(M=[CAST($0):BIGINT NOT NULL])\n"
+          + "    LogicalProject(M=[$0])\n"
+          + "      LogicalTableScan(table=[[scott, EMP]])\n";
+      assertThat(rewritten, hasTree(expectedPlan));
+      try (PreparedStatement ps = RelRunners.run(rewritten)) {
+        assertThat(CalciteAssert.toString(ps.executeQuery()),
+            is("S=108172\n"));
+      }
+    }
   }
 
   /**
