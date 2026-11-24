@@ -134,8 +134,8 @@ import com.google.common.collect.Iterables;
 import com.google.common.collect.Multimap;
 import com.google.common.collect.Sets;
 
-import org.checkerframework.checker.nullness.qual.NonNull;
-import org.checkerframework.checker.nullness.qual.Nullable;
+import org.jspecify.annotations.NonNull;
+import org.jspecify.annotations.Nullable;
 import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
@@ -2273,7 +2273,7 @@ public class RelMetadataTest {
               .distinct()
               .filter(b.equals(b.field("SAL"), b.literal(1)))
               .build();
-          final Holder<@Nullable RexCorrelVariable> v = Holder.empty();
+          final Holder<RexCorrelVariable> v = Holder.empty();
           final RelNode rel1 = b.scan("EMP")
               .variable(v::set)
               .project(b.field("DEPTNO"), b.field("SAL"))
@@ -2322,6 +2322,46 @@ public class RelMetadataTest {
         .assertThatAreColumnsUnique(bitSetOf(1), is(false))
         .assertThatAreColumnsUnique(bitSetOf(2), is(true))
         .assertThatUniqueKeysAre(bitSetOf(0), bitSetOf(2));
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7934">[CALCITE-7934]
+   * Aggregate uniqueness metadata uses incorrect column ordinals</a>. */
+  @Test void testAggregateUniquenessAfterAggregateProjectMerge() {
+    sql("select sal, max(empno) from emp group by sal")
+        .withRelTransform(RelMetadataTest::applyAggregateProjectMerge)
+        .withRelTransform(rel -> {
+          assertThat(rel, is(instanceOf(Aggregate.class)));
+          assertThat(((Aggregate) rel).getGroupSet(), is(bitSetOf(5)));
+          return rel;
+        })
+        .assertThatAreColumnsUnique(bitSetOf(1), is(true))
+        .assertThatUniqueKeysAre(bitSetOf(0), bitSetOf(1));
+
+    sql("select ename, sal, count(*) from emp where sal = 1000 group by ename, sal")
+        .withRelTransform(RelMetadataTest::applyAggregateProjectMerge)
+        .assertThatUniqueKeysAre(bitSetOf(0));
+
+    sql("select ename, sal, count(*) from emp\n"
+        + "group by grouping sets ((ename), (ename, sal))")
+        .withRelTransform(RelMetadataTest::applyAggregateProjectMerge)
+        .assertThatUniqueKeysAre(true, bitSetOf(0, 1));
+
+    sql("select d.name, e.empno, count(*)\n"
+        + "from dept as d join emp as e on d.deptno = e.deptno\n"
+        + "group by d.name, e.empno")
+        .withRelTransform(RelMetadataTest::applyAggregateProjectMerge)
+        .assertThatAreColumnsUnique(bitSetOf(0), is(false))
+        .assertThatAreColumnsUnique(bitSetOf(1), is(true))
+        .assertThatUniqueKeysAre(bitSetOf(1));
+  }
+
+  private static RelNode applyAggregateProjectMerge(RelNode rel) {
+    final HepProgramBuilder programBuilder = HepProgram.builder();
+    programBuilder.addRuleInstance(CoreRules.AGGREGATE_PROJECT_MERGE);
+    final HepPlanner planner = new HepPlanner(programBuilder.build());
+    planner.setRoot(rel);
+    return planner.findBestExp();
   }
 
   /**
@@ -3676,7 +3716,7 @@ public class RelMetadataTest {
   private void checkSize(String query, double expected) {
     final RelNode rel = sql(query).toRel();
     final RelMetadataQuery mq = rel.getCluster().getMetadataQuery();
-    final List<@Nullable Double> averageColumnSizes = mq.getAverageColumnSizes(rel);
+    final List<Double> averageColumnSizes = mq.getAverageColumnSizes(rel);
     assertNotNull(averageColumnSizes);
     assertThat(averageColumnSizes, hasSize(1));
     assertThat(averageColumnSizes.get(0), is(expected));
